@@ -1006,6 +1006,41 @@ def test_isolation_contains_memory_bomb(corpus, monkeypatch):
     assert r[0].errors   # contained as an incomplete scan, not a crashed run
 
 
+def test_result_channel_is_json_roundtrip(tmp_path):
+    # The isolation result channel is JSON on disk, not a pickle the parent would
+    # deserialize. A result with findings must survive write -> read -> rehydrate.
+    import json
+    fr = docwraith.FileResult("doc.pdf", "pdf")
+    fr.findings.append(docwraith.Finding("HIGH", "injection", "override",
+                                         "page 1", "msg", "snippet", ["hidden"]))
+    fr.errors.append("an error")
+    envelope = {"ok": True, "limit_warnings": [], "results": [docwraith.asdict(fr)]}
+    p = str(tmp_path / "res.json")
+    docwraith._write_result(p, envelope)
+    raw = Path(p).read_bytes()
+    parsed = json.loads(raw.decode("utf-8"))      # raises if it were a pickle
+    back = docwraith._results_from_envelope(parsed)
+    assert back[0].path == "doc.pdf"
+    assert (back[0].findings[0].severity, back[0].findings[0].rule) == ("HIGH", "override")
+    assert back[0].findings[0].hidden_reasons == ["hidden"]
+    assert back[0].errors == ["an error"]
+
+
+@iso_required
+def test_isolation_reports_unenforced_limit(corpus, monkeypatch):
+    # If an OS limit cannot be applied, the scan still runs but the weakened
+    # containment is surfaced rather than swallowed.
+    import resource
+
+    def boom(*a, **k):
+        raise OSError("cannot set rlimit here")
+
+    monkeypatch.setattr(resource, "setrlimit", boom)
+    r = docwraith.scan_target_isolated("file", corpus / "clean.pdf", None,
+                                       docwraith.Config())
+    assert any("isolation weakened" in e for e in r[0].errors)
+
+
 def test_manpage_version_in_sync():
     # The man page version must match __version__. If this fails, run
     # tools/stamp_version.py.

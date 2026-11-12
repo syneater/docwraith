@@ -61,7 +61,7 @@ except ImportError:  # pragma: no cover
     import xml.etree.ElementTree as ET
     SAFE_XML = False
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 # Project homepage, used only for the SARIF tool informationUri.
 HOMEPAGE = "https://www.aes451.dev/projects/docwraith"
@@ -2664,8 +2664,43 @@ def isolation_supported() -> bool:
     return "fork" in multiprocessing.get_all_start_methods()
 
 
-def _isolated_worker(kind, path, ck, cfg, conn):
-    """Child process: apply OS limits, scan the target, send the result back."""
+# The child runs the untrusted parser, so the result must travel back over a
+# channel the parent cannot be attacked through. multiprocessing pipes move
+# objects with pickle, and parent_conn.recv() would deserialize whatever the
+# child wrote: a parser compromised in the child could then execute code in the
+# unsandboxed parent and defeat the isolation. Instead the child writes its
+# result as JSON to a file, and the parent reads bounded, well-typed data only
+# after proc.join returns. That also removes the old blocking pipe read, whose
+# wall-clock bound covered only the time to the first byte, not a child that
+# sent one byte and stalled.
+_MAX_RESULT_BYTES = 256 * 1024 * 1024
+
+
+def _write_result(result_path: str, envelope: dict) -> None:
+    """Write the worker envelope to result_path atomically: temp file then rename.
+
+    The parent treats the presence of result_path as "the child finished and the
+    result is whole", so a child killed mid-write must not leave a half file at
+    that path. Writing to a .part sibling and renaming makes the final path
+    appear only once the bytes are fully on disk.
+    """
+    data = json.dumps(envelope).encode("utf-8")
+    tmp = result_path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, result_path)
+
+
+def _isolated_worker(kind, path, ck, cfg, result_path):
+    """Child process: apply OS limits, scan the target, write the result as JSON.
+
+    Any limit that cannot be applied is recorded and carried back rather than
+    swallowed, so the parent can tell the user a file was scanned with weaker
+    containment than they asked for instead of presenting it as fully isolated.
+    """
+    limit_warnings: list[str] = []
     try:
         import resource
         if cfg.mem_limit_bytes:
@@ -2673,64 +2708,111 @@ def _isolated_worker(kind, path, ck, cfg, conn):
                 resource.setrlimit(resource.RLIMIT_AS,
                                    (cfg.mem_limit_bytes, cfg.mem_limit_bytes))
             except (ValueError, OSError):
-                pass
+                limit_warnings.append("memory (RLIMIT_AS) limit could not be applied")
         if cfg.cpu_limit_seconds:
             try:
                 resource.setrlimit(resource.RLIMIT_CPU,
                                    (cfg.cpu_limit_seconds, cfg.cpu_limit_seconds + 2))
             except (ValueError, OSError):
-                pass
+                limit_warnings.append("CPU-time (RLIMIT_CPU) limit could not be applied")
         cfg.progress = None                      # no progress output from the child
-        conn.send(scan_target(kind, path, ck, cfg))
+        results = scan_target(kind, path, ck, cfg)
+        _write_result(result_path, {"ok": True, "limit_warnings": limit_warnings,
+                                    "results": [asdict(r) for r in results]})
     except BaseException as e:                   # includes MemoryError and SIGXCPU-driven exits
         try:
-            conn.send({"__error__": f"{type(e).__name__}: {e}"})
+            _write_result(result_path, {"ok": False, "limit_warnings": limit_warnings,
+                                        "error": f"{type(e).__name__}: {e}"})
         except Exception:
             pass
-    finally:
-        conn.close()
+
+
+def _finding_from_dict(d: dict) -> Finding:
+    return Finding(
+        d.get("severity", "INFO"), d.get("category", ""), d.get("rule", ""),
+        d.get("location", ""), d.get("message", ""), d.get("snippet", ""),
+        list(d.get("hidden_reasons") or []))
+
+
+def _results_from_envelope(envelope: dict) -> list[FileResult]:
+    out = []
+    for rd in envelope.get("results") or []:
+        fr = FileResult(rd.get("path", ""), rd.get("filetype", "unknown"))
+        fr.findings = [_finding_from_dict(f) for f in rd.get("findings") or []]
+        fr.errors = list(rd.get("errors") or [])
+        out.append(fr)
+    return out
+
+
+def _read_result(result_path: str) -> dict | None:
+    """Read and JSON-parse the worker result, bounded in size. None on any problem."""
+    try:
+        with open(result_path, "rb") as f:
+            raw = f.read(_MAX_RESULT_BYTES + 1)
+    except OSError:
+        return None
+    if not raw or len(raw) > _MAX_RESULT_BYTES:
+        return None
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 def scan_target_isolated(kind: str, path: Path, ck, cfg: Config) -> list[FileResult]:
     """Scan one target in a child bounded by memory, CPU and wall-clock limits.
 
-    If the child is killed by the kernel for exceeding memory or CPU, is
-    terminated for running past the wall-clock timeout, or crashes, the target
-    is reported as an incomplete scan rather than taking down the whole run.
+    The child writes its result to a temp file as JSON; the parent reads it only
+    after proc.join returns, so the wall-clock bound holds with no pickle and no
+    blocking read a stalling child could hang. If the child is killed by the
+    kernel for exceeding memory or CPU, is terminated for running past the
+    timeout, or crashes before writing a result, the target is reported as an
+    incomplete scan rather than taking down the whole run.
     """
     ctx = multiprocessing.get_context("fork")
-    parent_conn, child_conn = ctx.Pipe(False)
-    proc = ctx.Process(target=_isolated_worker,
-                       args=(kind, path, ck, cfg, child_conn), daemon=True)
-    proc.start()
-    child_conn.close()
-
-    payload = None
-    if parent_conn.poll(cfg.timeout_seconds):
-        try:
-            payload = parent_conn.recv()
-        except (EOFError, OSError):
-            payload = None
-    parent_conn.close()
-
-    proc.join(1)
-    if proc.is_alive():
-        proc.terminate()
-        proc.join(2)
+    fd, result_path = tempfile.mkstemp(prefix="docwraith_res_", dir=cfg.extract_dir)
+    os.close(fd)
+    try:
+        proc = ctx.Process(target=_isolated_worker,
+                           args=(kind, path, ck, cfg, result_path), daemon=True)
+        proc.start()
+        proc.join(cfg.timeout_seconds)
         if proc.is_alive():
-            proc.kill()
-            proc.join(1)
+            proc.terminate()
+            proc.join(2)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(1)
+        envelope = _read_result(result_path)
+        exitcode = proc.exitcode
 
-    if isinstance(payload, list):
-        return payload
-    r = FileResult(str(path), ck if kind == "container" else "unknown")
-    if isinstance(payload, dict) and "__error__" in payload:
-        r.errors.append(f"isolated scan failed: {payload['__error__']}; not fully analyzed")
-    else:
-        r.errors.append(f"isolated scan did not complete (killed by a memory, CPU or "
-                        f"{cfg.timeout_seconds}s wall-clock limit, or crashed); "
-                        "not fully analyzed")
-    return [r]
+        if isinstance(envelope, dict) and envelope.get("ok") and isinstance(envelope.get("results"), list):
+            results = _results_from_envelope(envelope)
+            warnings = envelope.get("limit_warnings") or []
+            if warnings and results:
+                for w in warnings:
+                    results[0].errors.append(
+                        f"isolation weakened: {w}; this file was scanned with less "
+                        "containment than requested")
+            return results
+
+        r = FileResult(str(path), ck if kind == "container" else "unknown")
+        if isinstance(envelope, dict) and envelope.get("ok") is False and envelope.get("error"):
+            r.errors.append(f"isolated scan failed: {envelope['error']}; not fully analyzed")
+            for w in (envelope.get("limit_warnings") or []):
+                r.errors.append(f"isolation weakened: {w}")
+        else:
+            r.errors.append(f"isolated scan did not complete (killed by a memory, CPU or "
+                            f"{cfg.timeout_seconds}s wall-clock limit, or crashed; "
+                            f"exit code {exitcode}); not fully analyzed")
+        return [r]
+    finally:
+        for p in (result_path, result_path + ".part"):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
 
 
 def iter_targets(paths: list[str], recursive: bool):

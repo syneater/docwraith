@@ -8,6 +8,64 @@ changes live in the git history and the README, not here.
 Severity reflects impact on the analyst running the scan, not on any document
 author.
 
+## 0.16.0
+
+A self-audit of the 0.15.0 isolation feature. Isolation bounds what a hostile
+parser can consume, but the audit found the channel carrying the result back out
+of the sandbox was itself a weak point. Both fixes harden the exit path so
+containment holds in both directions.
+
+### SEC-017 (Medium) Isolation result channel deserialized with pickle
+
+- **What.** The isolated worker returned its result over a `multiprocessing`
+  pipe, and the parent read it with `Connection.recv()`, which unpickles
+  whatever the child wrote. The whole purpose of `--isolate` is to contain a
+  hostile parser, but the containment was one-directional: it bounded the
+  child's memory and CPU while trusting the bytes coming back.
+- **Impact.** If a parser reached code execution inside the child, most
+  plausibly through a native-code CVE in Pillow or an image codec on the
+  `--ocr` path, the child controlled the pipe and the parent deserialized
+  attacker-controlled data. Unpickling attacker-controlled data is arbitrary
+  code execution, which would run in the unsandboxed parent and defeat the
+  isolation at its exit. A secondary defect: `parent_conn.poll(timeout)` bounded
+  only the time to the first byte, so a cooperating malicious child could send
+  one byte and then stall, hanging the parent past the wall-clock limit.
+- **Fix.** The worker now writes its result as JSON to a temp file, atomically
+  via a `.part` rename, and the parent reads bounded, well-typed data with
+  `json.loads` after `proc.join` returns. No pickle is deserialized, and the
+  wall-clock bound is enforced by `join` with no blocking read a stalling child
+  could hang. The result is capped at 256 MiB; anything larger or unparseable is
+  treated as an incomplete scan.
+- **Verification.** `test_result_channel_is_json_roundtrip`, plus the existing
+  `test_isolated_scan_matches_inprocess`, `test_isolation_contains_timeout` and
+  `test_isolation_contains_memory_bomb`.
+
+### SEC-018 (Low) Unenforceable OS limits were swallowed silently
+
+- **What.** In the worker, a `setrlimit` call that failed was caught and
+  ignored. If the kernel refused the memory or CPU limit, the child ran with no
+  such cap and its result looked identical to a properly bounded one.
+- **Impact.** A user who asked for a 2 GB memory cap could be scanning with no
+  memory cap and never know. The wall-clock timeout remained as a backstop, so
+  this was a weakening of containment, not a removal of it.
+- **Fix.** A limit that cannot be applied is recorded and carried back in the
+  result envelope. The parent surfaces it as an `isolation weakened` error line
+  on that file, which also marks the run incomplete rather than clean.
+- **Verification.** `test_isolation_reports_unenforced_limit`.
+
+### Noted, isolation-dependent (no code change)
+
+- **In-process memory spikes.** `scan_pdf_attachments` materializes each
+  embedded blob through `reader.attachments` before the per-member size check,
+  and the direct-open Office path bounds peak memory per member (64 MiB) but
+  keeps no cumulative actual-bytes counter. Peak memory is held at roughly one
+  member at a time, and `RLIMIT_AS` under the default isolation bounds it fully.
+  Running `--no-isolate` on untrusted input forgoes that bound by design.
+- **Search-regex ReDoS.** A `--find-regex` or `re:` term is the user's own
+  input but runs against attacker-controlled document text, so a catastrophic
+  pattern can hang on a crafted document. The CPU and wall-clock limits under
+  isolation contain it.
+
 ## 0.15.0
 
 Execution isolation, the safety item the external review named as the missing
