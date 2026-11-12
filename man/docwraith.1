@@ -1,0 +1,169 @@
+.\" Version and date on the .TH line are stamped by tools/stamp_version.py; do not edit by hand.
+.TH DOCWRAITH 1 "2026-11-12" "docwraith 0.15.0" "User Commands"
+.SH NAME
+docwraith \- scan Office documents and PDFs for embedded AI instructions, hidden text and provenance markers
+.SH SYNOPSIS
+.B docwraith
+.RI [ options ]
+.IR path " [" path " ...]"
+.SH DESCRIPTION
+.B docwraith
+examines Word (.docx), PowerPoint (.pptx), Excel (.xlsx), OpenDocument
+(.odt/.ods/.odp) and PDF files for content that a human reader would not see
+but an automated reader would, and for markers describing a file's origin and
+integrity.
+.PP
+Each
+.I path
+is a file or a directory. Directories are scanned for recognized document
+types; add
+.B \-r
+to recurse. A path may also be an archive (.zip, .tar, .tar.gz/.tgz, .rar),
+whose document members are extracted to a temporary directory, scanned, and
+then removed. Files are identified by content, not by extension, so a renamed
+file is still classified correctly.
+.PP
+Findings fall into categories: prompt-injection instructions, hidden text,
+Unicode smuggling, AI provenance tags, decoded watermarks, user search-term
+matches, external references, review comments, and document-integrity
+indicators. Each finding carries a severity of HIGH, MEDIUM, LOW or INFO.
+.SH OPTIONS
+.TP
+.BR \-r ", " \-\-recursive
+Recurse into directories.
+.TP
+.B \-\-json
+Emit a JSON report on stdout instead of the text report. Mutually exclusive
+with \fB\-\-sarif\fR.
+.TP
+.B \-\-sarif
+Emit a SARIF 2.1.0 report on stdout, for code-scanning dashboards and CI.
+Mutually exclusive with \fB\-\-json\fR.
+.TP
+.BI \-\-min\-severity " LEVEL"
+Hide findings below \fILEVEL\fR in the text report. One of INFO, LOW, MEDIUM,
+HIGH. Default INFO.
+.TP
+.BI \-\-fail\-on " LEVEL"
+Exit 1 if any finding is at or above \fILEVEL\fR. One of INFO, LOW, MEDIUM,
+HIGH. Default MEDIUM.
+.TP
+.BR \-v ", " \-\-verbose
+Progress to stderr. Repeat for more detail: \fB\-v\fR prints one line per file,
+\fB\-vv\fR adds per-page and per-part detail and lists each finding as it is
+produced. Progress always goes to stderr so a \fB\-\-json\fR or \fB\-\-sarif\fR
+report on stdout stays clean.
+.TP
+.BI \-\-find " STRING"
+Report whether \fISTRING\fR appears anywhere in the document
+(case-insensitive, matched against raw text, a normalized form, and the raw
+bytes). Repeatable.
+.TP
+.BI \-\-find\-regex " PATTERN"
+As \fB\-\-find\fR, with a regular expression. Repeatable.
+.TP
+.BI \-\-find\-file " FILE"
+Read search terms from \fIFILE\fR, one per line. Blank lines and lines starting
+with \fB#\fR are ignored; a line starting with \fBre:\fR is a regular
+expression. Repeatable.
+.TP
+.B \-\-emails
+Report every email address found, in body text, hidden text, metadata,
+annotations or raw bytes.
+.TP
+.BI \-o ", " \-\-output " FILE"
+Write the report to \fIFILE\fR instead of stdout. The one-line summary still
+prints to stdout and the exit code is unchanged.
+.TP
+.BI \-\-extract\-dir " DIR"
+Parent directory for archive extraction, instead of the system temp location.
+The temporary directory created under it is removed after scanning.
+.TP
+.BI \-\-max\-members " N"
+Maximum number of archive members to process before aborting the archive.
+Default 10000.
+.TP
+.BI \-\-max\-bytes " SIZE"
+Total extracted-size cap for an archive. Accepts a K, M or G suffix. Default
+300M.
+.TP
+.BI \-\-max\-member\-bytes " SIZE"
+Per-member extracted-size cap. Accepts a K, M or G suffix. Default 64M.
+.TP
+.BI \-\-password\-file " FILE"
+Read a password for encrypted documents from \fIFILE\fR (first line). The
+password is never passed on the command line.
+.TP
+.B \-\-password\-prompt
+Prompt for a password on the terminal, without echoing it.
+.TP
+.B \-\-ocr
+OCR embedded raster images and scan the recovered text. Needs the tesseract
+engine and is slower, so it is off by default.
+.TP
+.BR \-\-isolate ", " \-\-no\-isolate
+Scan each file in a child process bounded by memory, CPU and wall-clock limits,
+so a crash, hang or allocation bomb in a parser is contained to one file.
+Default on where the platform supports it (Linux and macOS).
+.TP
+.BI \-\-timeout " SECONDS"
+Per-file wall-clock limit when isolating (default 120).
+.TP
+.BI \-\-mem\-limit " SIZE"
+Per-file memory limit when isolating, with a K, M or G suffix (default 2G).
+.TP
+.BI \-\-cpu\-limit " SECONDS"
+Per-file CPU-time limit when isolating (default 60).
+.TP
+.B \-\-version
+Print the version and exit.
+.TP
+.B \-h ", " \-\-help
+Print a usage summary and exit.
+.SH EXIT STATUS
+.TP
+.B 0
+No finding at or above the \fB\-\-fail\-on\fR level.
+.TP
+.B 1
+At least one finding at or above the \fB\-\-fail\-on\fR level.
+.TP
+.B 2
+Scan errors occurred and no finding reached the \fB\-\-fail\-on\fR level.
+.SH EXAMPLES
+.TP
+Scan one file:
+.B docwraith resume.pdf
+.TP
+Scan a tree and fail a CI job only on HIGH findings:
+.B docwraith \-\-fail\-on HIGH \-r ./inbox
+.TP
+Produce SARIF for a code-scanning dashboard:
+.B docwraith \-\-sarif \-o results.sarif \-r ./inbox
+.TP
+Look inside an archive for a leaked address and log links:
+.B docwraith \-\-emails bundle.zip
+.TP
+Hunt a watermark list and keep only notable findings:
+.B docwraith \-\-find\-file terms.txt \-\-min\-severity LOW ./docs
+.SH FILES
+.TP
+.I requirements.txt
+Runtime dependencies: pypdf and (recommended) defusedxml.
+.SH NOTES
+docwraith parses attacker-controlled input and is hardened accordingly, but it is
+not a sandbox. For bulk or hostile input, run it under \fBtimeout\fR(1) and a
+memory \fBulimit\fR(1), ideally as an unprivileged user in a container. Install
+\fBdefusedxml\fR for untrusted XML. A password for an encrypted document is
+taken from \fB\-\-password\-file\fR, \fB\-\-password\-prompt\fR or the
+\fBDOCWRAITH_PASSWORD\fR environment variable, never from the command line;
+encrypted Office documents also need the \fBmsoffcrypto-tool\fR package.
+\fB\-\-ocr\fR needs the \fBtesseract\fR engine and the \fBpytesseract\fR and
+\fBPillow\fR packages. RAR support needs the \fBrarfile\fR package
+and an external tool (\fBunrar\fR, \fBunar\fR, \fBbsdtar\fR or \fB7z\fR) on PATH.
+.SH SEE ALSO
+Full documentation, the detection reference and the security model are in
+\fIREADME.md\fR; the security-finding history is in
+\fISECURITY_CHANGELOG.md\fR.
+.SH LICENSE
+MIT.
