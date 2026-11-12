@@ -8,6 +8,68 @@ changes live in the git history and the README, not here.
 Severity reflects impact on the analyst running the scan, not on any document
 author.
 
+## 0.16.1
+
+A second external review (another model) run against 0.16.0. It reproduced two
+detection bypasses, both of which let a document carrying a real payload return a
+clean result.
+
+### SEC-019 (High) Duplicate ZIP members hid a payload from a name-based scan
+
+- **What.** A ZIP may hold two entries with the same path. zipfile, and so this
+  scanner, resolves a part by name and gets only one of them, by default the
+  last. The archive-extraction path already defends against this with
+  index-prefixed directories, but a directly-opened Office document did not: its
+  parts are read by name.
+- **Impact.** An attacker ships a benign `word/document.xml` last and a malicious
+  one earlier. Some renderers use the earlier copy, yet the scanner reads the
+  later one and reports nothing. Confirmed by local reproduction in the review: a
+  two-entry DOCX returned zero findings.
+- **Fix.** `zip_size_guard`, which runs for every directly-opened Office format,
+  now calls `check_duplicate_zip_members`. Any duplicate name is reported at HIGH,
+  which alone stops the file being called clean, and every copy of a duplicated
+  text part is read by its `ZipInfo` and analyzed, so a payload in a shadowed copy
+  still escalates.
+- **Verification.** `test_duplicate_docx_member_flagged_and_shadowed_copy_scanned`.
+
+### SEC-020 (High) Encoded-payload reporting cap silently stopped analysis
+
+- **What.** `scan_encoded_payloads` stopped at `_ENCODED_MAX_REPORTS` (25) with a
+  bare `return`, which ended both the per-payload reporting and the analysis, and
+  emitted no incompleteness marker. This was a separate early-return path from the
+  candidate and decoded-byte budgets fixed in SEC-016.
+- **Impact.** A document with more than 25 encoded runs that decode to readable
+  text would have its 26th and later runs neither analyzed nor flagged as skipped.
+  Confirmed by reproduction: 26 benign Base64 strings followed by an encoded
+  injection left the injection undetected and the scan reported as complete.
+- **Fix.** The report cap now bounds only how many per-payload findings are
+  listed. Every decoded run is still fed through `analyze_text`, bounded by the
+  candidate and decoded-byte budgets, so a payload placed after a wall of benign
+  readable ones still escalates. One `encoded_reports_capped` note marks where
+  individual listing stops.
+- **Verification.** `test_encoded_payload_past_report_cap_still_analyzed`.
+
+### OCR page-cap consistency (Low, no finding id)
+
+- `scan_pdf_images` iterated every page while honoring only the image cap, so a
+  PDF with few images but very many pages could drive the OCR loop past the
+  intended page bound. It now honors `max_pdf_pages` and reports when OCR is
+  truncated by either the page cap or the image cap. `requirements.txt` now states
+  `defusedxml` as required for the security posture rather than recommended; the
+  code still runs without it and fails closed on any DTD.
+
+### Reviewed, contained, not changed
+
+- **PDF attachment and content-stream materialization.** `reader.attachments`
+  and `contents.operations` can decompress or parse before the per-item size cap
+  is checked, a memory-pressure path. The review did not demonstrate exhaustion.
+  The default isolation address-space limit bounds it; a streaming or
+  manual-walk fix is tracked for a later change rather than rushed into a
+  security release.
+- **Isolation is resource containment, not a filesystem or network sandbox.**
+  This is stated in SEC-017 and the README, and the shipped Docker confinement is
+  the answer for filesystem and network reach.
+
 ## 0.16.0
 
 A self-audit of the 0.15.0 isolation feature. Isolation bounds what a hostile

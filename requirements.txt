@@ -1,5 +1,5 @@
 pypdf>=4.0
-defusedxml>=0.7  # recommended; hardened XML parsing for untrusted documents
+defusedxml>=0.7  # required for the security posture; hardened XML parsing for untrusted documents. Without it the tool still runs but fails closed on any DTD.
 rarfile>=4.0  # optional, only for .rar; also needs unrar/unar/bsdtar/7z on PATH
 msoffcrypto-tool>=5.0  # optional, only to scan password-encrypted Office documents
 pytesseract>=0.3.10  # optional, only for --ocr; also needs the tesseract engine on PATH

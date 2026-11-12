@@ -61,7 +61,7 @@ except ImportError:  # pragma: no cover
     import xml.etree.ElementTree as ET
     SAFE_XML = False
 
-__version__ = "0.16.0"
+__version__ = "0.16.1"
 
 # Project homepage, used only for the SARIF tool informationUri.
 HOMEPAGE = "https://www.aes451.dev/projects/docwraith"
@@ -454,14 +454,25 @@ def scan_encoded_payloads(text: str, location: str, res: FileResult, cfg: Config
             if not s:
                 continue
             reason = hidden + [f"{label}-encoded"]
-            res.findings.append(Finding(
-                "MEDIUM", "smuggling", f"{label}_payload", location,
-                f"{label} string decodes to readable text (possible obfuscated payload)",
-                s[:160], reason))
+            # The report cap bounds only how many per-payload findings are listed,
+            # never whether a payload is analyzed. Every decoded run is still fed
+            # back through analyze_text (bounded by the candidate and decoded-byte
+            # budgets above), so a malicious payload placed after a wall of benign
+            # readable ones still escalates. A single note marks where individual
+            # reporting stops, so a reader is not misled into thinking the listed
+            # payloads are all there were.
+            if reported < _ENCODED_MAX_REPORTS:
+                res.findings.append(Finding(
+                    "MEDIUM", "smuggling", f"{label}_payload", location,
+                    f"{label} string decodes to readable text (possible obfuscated payload)",
+                    s[:160], reason))
+                reported += 1
+                if reported == _ENCODED_MAX_REPORTS:
+                    res.findings.append(Finding(
+                        "LOW", "smuggling", "encoded_reports_capped", location,
+                        f"more than {_ENCODED_MAX_REPORTS} encoded runs decode to readable text; "
+                        "later ones are still analyzed but not listed individually", "", hidden))
             analyze_text(s, location, res, cfg, reason, report_plain_hidden=False, _depth=depth + 1)
-            reported += 1
-            if reported >= _ENCODED_MAX_REPORTS:
-                return
 
 
 def decode_tag_smuggling(text: str) -> str:
@@ -1129,12 +1140,52 @@ def scan_docx_metadata(z, names, res: FileResult, cfg: Config) -> None:
 # PPTX, XLSX and OpenDocument (odt/ods/odp)
 # ---------------------------------------------------------------------------
 
+def check_duplicate_zip_members(z: zipfile.ZipFile, res: FileResult, cfg: Config) -> None:
+    """Flag and inspect ZIP members that share a name inside an Office document.
+
+    A ZIP may legally hold two entries with the same path. A reader that resolves
+    a part by name, as zipfile and this scanner do, gets only one of them, by
+    default the last. An attacker can therefore ship a benign 'word/document.xml'
+    last and a malicious one earlier: the earlier copy is what some renderers use,
+    yet a name-based scan never reads it. So any duplicate is reported at HIGH,
+    which alone stops the document being called clean, and every copy of a
+    duplicated text part is read by ZipInfo and analyzed, so a payload hidden in a
+    shadowed copy still escalates.
+    """
+    by_name: dict[str, list] = {}
+    for info in z.infolist():
+        by_name.setdefault(info.filename, []).append(info)
+    for name, infos in by_name.items():
+        if len(infos) < 2 or name.endswith("/"):
+            continue
+        res.findings.append(Finding(
+            "HIGH", "integrity", "duplicate_zip_member", name,
+            f"{len(infos)} ZIP members share the name '{name}'; readers may disagree on "
+            "which is used, and a name-based scan reads only one, so a payload in another "
+            "copy can go unseen", ""))
+        if not name.lower().endswith((".xml", ".rels", ".txt")):
+            continue
+        for idx, info in enumerate(infos):
+            try:
+                with z.open(info) as f:
+                    data = f.read(cfg.max_member_bytes + 1)
+            except Exception:
+                continue
+            if len(data) > cfg.max_member_bytes:
+                continue
+            text = re.sub(rb"<[^>]+>", b" ", data).decode("utf-8", errors="replace")
+            analyze_text(text, f"{name} (duplicate copy {idx + 1}/{len(infos)})", res, cfg,
+                         ["shadowed duplicate ZIP member"], report_plain_hidden=False)
+
+
 def zip_size_guard(z: zipfile.ZipFile, res: FileResult, cfg: Config) -> bool:
     """Reject a ZIP-based document that is a member bomb or over the size cap.
 
     This runs for every Office format opened directly (docx, pptx, xlsx and the
     OpenDocument family), so the member-count and total-size caps that the
     archive-extraction path enforces also apply to a document opened on its own.
+    It also surfaces duplicate member names, which a name-based part lookup would
+    otherwise silently resolve to a single copy.
     """
     infos = z.infolist()
     if len(infos) > cfg.max_members:
@@ -1144,6 +1195,7 @@ def zip_size_guard(z: zipfile.ZipFile, res: FileResult, cfg: Config) -> bool:
     if total > cfg.max_unzipped_bytes:
         res.errors.append(f"document declares {total} bytes uncompressed, over the limit; skipped")
         return False
+    check_duplicate_zip_members(z, res, cfg)
     return True
 
 
@@ -1910,12 +1962,20 @@ def scan_pdf_images(reader, res: FileResult, cfg: Config) -> None:
     _cap_pil_pixels(cfg)
     done = 0
     for pno, page in enumerate(reader.pages, start=1):
+        # Honor the same page cap as the text scan, so a PDF with few images but
+        # very many pages cannot drive this loop past the intended bound.
+        if pno > cfg.max_pdf_pages:
+            res.errors.append(f"OCR stopped at the {cfg.max_pdf_pages}-page cap; images on "
+                              "later pages were not read")
+            return
         try:
             images = page.images
         except Exception:
             continue
         for img in images:
             if done >= cfg.ocr_max_images:
+                res.errors.append(f"OCR stopped at the {cfg.ocr_max_images}-image cap; later "
+                                  "images were not read")
                 return
             done += 1
             try:
