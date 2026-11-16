@@ -295,12 +295,14 @@ These are the gaps worth knowing about before trusting a clean result:
 ## Tests
 
 ```
-pip install pytest python-docx reportlab python-pptx openpyxl odfpy
+pip install -r requirements-dev.txt     # runtime deps plus the fixture builders
 python -m pytest tests
-python tests/make_samples.py samples/   # write the synthetic corpus to disk
+python tests/make_samples.py samples/    # write the synthetic corpus to disk
 ```
 
-`tests/make_samples.py` builds one clean and one hostile file per technique, so a failing test points at the detector that missed. Run it on its own to write the whole corpus to disk for manual poking.
+`requirements-dev.txt` pulls in the runtime requirements and the libraries that build the sample documents, so the full suite runs from a clean clone. `tests/make_samples.py` builds one clean and one hostile file per technique, so a failing test points at the detector that missed. Run it on its own to write the whole corpus to disk for manual poking.
+
+The synthetic corpus is deliberately hostile by design: it contains benign prompt-injection strings, hidden and smuggled text, homoglyph and zero-width payloads, and, in the test suite only, a path-traversal archive and a decompression bomb. All of it is inert to a human reader, carries no malware or secrets, and is written only to throwaway temp directories or the output folder you name. None of it is committed; `samples/` is git-ignored.
 
 ## Documentation
 

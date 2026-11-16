@@ -1,0 +1,28 @@
+# Development and test dependencies for Docwraith.
+#
+# Installs the runtime requirements too, so one command sets up a full test env:
+#     pip install -r requirements-dev.txt
+#     python -m pytest tests
+#
+# Versions are floors, matched to what the suite is validated against. For a
+# fully reproducible, hash-pinned set, compile these with pip-tools:
+#     pip-compile --generate-hashes -o requirements-dev.lock requirements-dev.txt
+
+-r requirements.txt
+
+pytest>=8.0        # test runner
+
+# Fixture builders used by tests/make_samples.py and tests/test_docwraith.py to
+# synthesize the clean and hostile sample documents.
+python-docx>=1.1   # .docx fixtures
+python-pptx>=1.0   # .pptx fixtures
+openpyxl>=3.1      # .xlsx fixtures
+odfpy>=1.4         # .odt fixtures
+reportlab>=4.0     # .pdf fixtures
+Pillow>=9.0        # image fixtures and OCR input
+
+# Optional. Install these only to exercise the matching optional runtime
+# features in the suite; the tests skip or degrade cleanly without them.
+# rarfile>=4.0           # .rar archives (also needs unrar/unar/bsdtar/7z on PATH)
+# msoffcrypto-tool>=5.0  # password-encrypted Office documents
+# pytesseract>=0.3.10    # --ocr path (also needs the tesseract engine on PATH)
